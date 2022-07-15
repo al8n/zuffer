@@ -5,10 +5,14 @@
 #![deny(missing_docs)]
 
 use fmmap::{MmapFileExt, MmapFileMut, MmapFileMutExt};
+use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
+
+const TEMP_FILE_NAME_LEN: usize = 16;
+const TEMP_FILE_SUFFIX: &str = "buffer";
 
 ///
 #[derive(Debug, thiserror::Error)]
@@ -22,6 +26,12 @@ pub enum Error {
     ///
     #[error("fail to truncate buffer: {0}")]
     TruncateError(fmmap::error::Error),
+    ///
+    #[error("fail to mmap temp file")]
+    FailToMmapTempFile(#[from] fmmap::error::Error),
+    ///
+    #[error("IO error")]
+    IO(#[from] std::io::Error),
 }
 
 /// Config auto mmap
@@ -202,16 +212,36 @@ impl Buffer {
                 if let Some(ref meta) = self.auto_mmap_meta {
                     if meta.after > 0 && self.cur_size > meta.after {
                         self.buf_type = BufferType::Mmap;
-                        // TODO: add more useful methods in fmmap crate
-                        // !if self.persistent {
-                        // set remove on drop for memmap file
-                        // }
-                        // let mmap_file = MmapFileMut::create_with_options(path, opts);
-                        // self.mmap_file = MmapFileMut::create(
-                        //     &meta.dir,
-                        //     &format!("{}-{}", self.tag, self.cur_size),
-                        //     self.cur_size,
-                        // )?;
+                        let mut temp_file = std::env::temp_dir();
+
+                        temp_file.push(
+                            thread_rng()
+                                .sample_iter(&Alphanumeric)
+                                .take(TEMP_FILE_NAME_LEN)
+                                .map(char::from)
+                                .collect::<String>(),
+                        );
+
+                        temp_file.set_extension("buffer");
+
+                        let mut mmap_file =
+                            MmapFileMut::create(temp_file).map_err(Error::FailToMmapTempFile)?;
+
+                        if !self.persistent {
+                            mmap_file.set_remove_on_drop(true);
+                        }
+
+                        mmap_file
+                            .truncate(self.cur_size as u64)
+                            .map_err(Error::FailToMmapTempFile)?;
+
+                        mmap_file
+                            .write_all(self.mmap_file.as_slice(), 0)
+                            .map_err(Error::FailToMmapTempFile)?;
+
+                        mmap_file.flush().map_err(Error::FailToMmapTempFile)?;
+
+                        self.mmap_file = mmap_file;
                         return Ok(());
                     }
                 }
