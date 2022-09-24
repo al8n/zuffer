@@ -7,6 +7,7 @@
 use fmmap::{MmapFileExt, MmapFileMut, MmapFileMutExt};
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use std::{
+    borrow::Borrow,
     cell::RefCell,
     path::{Path, PathBuf},
     sync::atomic::{AtomicI64, Ordering},
@@ -390,10 +391,11 @@ impl Buffer {
     }
 
     /// `slice` would return the slice written at offset.
-    pub fn slice(&self, offset: i64) -> (Option<&[u8]>, i64) {
+    pub fn slice(&self, offset: i64) -> (&[u8], i64) {
+        const EMPTY: &[u8] = &[];
         let cur_offset = self.offset.load(Ordering::SeqCst);
         if offset >= cur_offset {
-            return (None, -1);
+            return (EMPTY, -1);
         }
 
         let size = u32::from_be_bytes(
@@ -409,7 +411,7 @@ impl Buffer {
             next = -1;
         }
 
-        (Some(res), next)
+        (res, next)
     }
 
     /// `slice_mut` would return the slice written at offset.
@@ -458,15 +460,10 @@ impl Buffer {
         while next >= 0 {
             let (slice, nxt) = self.slice(next);
             next = nxt;
-            if let Some(s) = slice {
-                if s.is_empty() {
-                    continue;
-                }
-
-                if let Err(e) = f(s) {
-                    return Err(e);
-                }
+            if slice.is_empty() {
+                continue;
             }
+            f(slice)?;
         }
         Ok(())
     }
@@ -474,7 +471,7 @@ impl Buffer {
     ///
     pub fn slice_iterate_mut<F>(&mut self, mut f: F) -> Result<(), Error>
     where
-        F: FnMut(&mut [u8]) -> Result<(), Error>,
+        F: Fn(&mut [u8]) -> Result<(), Error>,
     {
         if self.is_empty() {
             return Ok(());
@@ -497,7 +494,10 @@ impl Buffer {
         Ok(())
     }
 
-    fn sort_slice(&mut self, less: impl Less) -> Result<(), Error> {
+    fn sort_slice<L>(&mut self, less: L) -> Result<(), Error>
+    where
+        L: Copy + Fn(&[u8], &[u8]) -> bool,
+    {
         self.sort_slice_between(
             self.start_offset(),
             self.offset.load(Ordering::SeqCst),
@@ -505,7 +505,10 @@ impl Buffer {
         )
     }
 
-    fn sort_slice_between(&mut self, start: i64, end: i64, less: impl Less) -> Result<(), Error> {
+    fn sort_slice_between<L>(&mut self, start: i64, end: i64, less: L) -> Result<(), Error>
+    where
+        L: Copy + Fn(&[u8], &[u8]) -> bool,
+    {
         if start >= end {
             return Ok(());
         }
@@ -536,7 +539,6 @@ impl Buffer {
             offsets: offsets.as_slice(),
             original: self,
             tmp: RefCell::new(Buffer::new(sz_tmp, tag)),
-            less,
             small: {
                 let mut vec = Vec::with_capacity(1024);
                 vec.fill(0);
@@ -546,31 +548,27 @@ impl Buffer {
 
         let mut left = offsets[0];
         for off in offsets.iter().skip(1) {
-            s.sort_small(left, *off)?;
+            s.sort_small(left, *off, less)?;
             left = *off;
         }
 
-        s.sort(0, offsets.len() - 1);
+        s.sort(0, offsets.len() - 1, less);
         Ok(())
     }
 }
 
-///
-pub trait Less {
-    ///
-    fn less(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering;
-}
-
-struct SortHelper<'a, L: Less> {
+struct SortHelper<'a> {
     offsets: &'a [i64],
     original: &'a mut Buffer,
     tmp: RefCell<Buffer>,
-    less: L,
     small: Vec<i64>,
 }
 
-impl<'a, L: Less> SortHelper<'a, L> {
-    fn sort_small(&mut self, start: i64, end: i64) -> Result<(), Error> {
+impl<'a> SortHelper<'a> {
+    fn sort_small<L>(&mut self, start: i64, end: i64, mut less: L) -> Result<(), Error>
+    where
+        L: Copy + Fn(&[u8], &[u8]) -> bool,
+    {
         self.tmp.borrow().reset();
         self.small.clear();
         let mut next = start;
@@ -581,40 +579,29 @@ impl<'a, L: Less> SortHelper<'a, L> {
         }
 
         // We are sorting the slices pointed to by s.small offsets, but only moving the offsets around.
-        self.small.sort_by(|a, b| {
-            let (left, _) = self.original.slice(*a);
-            let (right, _) = self.original.slice(*b);
-            match (left, right) {
-                (None, None) => std::cmp::Ordering::Equal,
-                (None, Some(_)) => std::cmp::Ordering::Less,
-                (Some(_), None) => std::cmp::Ordering::Greater,
-                (Some(left), Some(right)) => self.less.less(left, right),
-            }
+        indexsort::sort_slice(&mut self.small, |small, i, j| {
+            let (left, _) = self.original.slice(small[i]);
+            let (right, _) = self.original.slice(small[j]);
+            less(left, right)
         });
 
         // Now we iterate over the s.small offsets and copy over the slices. The result is now in order.
-        let src = self.original.mmap_file.as_mut_slice();
         for off in self.small.iter() {
-            self.tmp
-                .borrow_mut()
-                .write(raw_slice(&src[*off as usize..]))?;
+            let src = &self.original.mmap_file.as_slice()[*off as usize..];
+            self.tmp.borrow_mut().write(raw_slice(src))?;
         }
 
-        let sz = (end - start) as usize;
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.tmp.borrow().bytes().as_ptr(),
-                src[start as usize..end as usize].as_mut_ptr(),
-                sz,
-            );
-        }
-
-        Ok(())
+        self.original
+            .mmap_file
+            .write_all(self.tmp.borrow().bytes(), start as usize)
+            .map_err(From::from)
     }
 
-    fn sort(&self, lo: usize, hi: usize) -> &[u8] {
+    fn sort<L>(&self, lo: usize, hi: usize, less: L) -> &[u8]
+    where
+        L: Copy + Fn(&[u8], &[u8]) -> bool,
+    {
         assert!(lo <= hi);
-
         let mid = lo + (hi - lo) / 2;
         let (loff, hoff) = (self.offsets[lo] as usize, self.offsets[hi] as usize);
 
@@ -623,16 +610,19 @@ impl<'a, L: Less> SortHelper<'a, L> {
         }
 
         // lo, mid would sort from [offset[lo], offset[mid]) .
-        let left = self.sort(lo, mid);
+        let left = self.sort(lo, mid, less);
         // Typically we'd use mid+1, but here mid represents an offset in the buffer. Each offset
         // contains a thousand entries. So, if we do mid+1, we'd skip over those entries.
-        let right = self.sort(mid, hi);
+        let right = self.sort(mid, hi, less);
 
-        self.merge(left, right, loff, hoff);
+        self.merge(left, right, loff, hoff, less);
         &self.original.mmap_file.as_slice()[loff..hoff]
     }
 
-    fn merge(&self, left: &[u8], right: &[u8], mut start: usize, end: usize) {
+    fn merge<L>(&self, left: &[u8], right: &[u8], mut start: usize, end: usize, less: L)
+    where
+        L: Copy + Fn(&[u8], &[u8]) -> bool,
+    {
         if left.is_empty() || right.is_empty() {
             return;
         }
@@ -644,7 +634,6 @@ impl<'a, L: Less> SortHelper<'a, L> {
         }
         let mut left = tmp.bytes();
         let mut right = right;
-
         while start < end {
             if left.is_empty() {
                 unsafe {
@@ -665,8 +654,8 @@ impl<'a, L: Less> SortHelper<'a, L> {
             let ls = raw_slice(left);
             let rs = raw_slice(right);
 
-            match self.less.less(&ls[4..], &rs[4..]) {
-                std::cmp::Ordering::Less => {
+            match less(&ls[4..], &rs[4..]) {
+                true => {
                     let src_len = ls.len();
                     unsafe {
                         let ptr =
@@ -677,7 +666,7 @@ impl<'a, L: Less> SortHelper<'a, L> {
                     left = &left[src_len..];
                     start += src_len;
                 }
-                _ => {
+                false => {
                     let src_len = rs.len();
                     unsafe {
                         let ptr =
@@ -695,7 +684,7 @@ impl<'a, L: Less> SortHelper<'a, L> {
 
 fn raw_slice(buf: &[u8]) -> &[u8] {
     let sz = u32::from_be_bytes(buf[..4].try_into().unwrap());
-    &buf[..sz as usize]
+    &buf[..4 + sz as usize]
 }
 
 #[inline]
@@ -799,26 +788,23 @@ mod tests {
         eprintln!("Buffer size: {}", buffer.len_with_padding());
     }
 
-    struct L;
-    impl Less for L {
-        fn less(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
-            let left = u32::from_be_bytes(a[..4].try_into().unwrap());
-            let right = u32::from_be_bytes(b[..4].try_into().unwrap());
-            left.cmp(&right)
-        }
-    }
-
     #[test]
     fn test_buffer_simple_sort() {
         let buffers = new_test_buffers(1 << 20);
         let mut rng = rand::thread_rng();
         for mut buffer in buffers {
-            (0..25600).for_each(|_| {
+            (0..25600).for_each(|i| {
                 let b = buffer.slice_allocate(4).unwrap();
                 b.copy_from_slice(u32::to_be_bytes(rng.gen_range(0..25600)).as_slice());
             });
 
-            buffer.sort_slice(L).unwrap();
+            buffer
+                .sort_slice(|ls, rs| {
+                    let left = u32::from_be_bytes(ls[..4].try_into().unwrap());
+                    let right = u32::from_be_bytes(rs[..4].try_into().unwrap());
+                    left < right
+                })
+                .unwrap();
             let mut last = 0u32;
             let mut i = 0;
             buffer
@@ -828,7 +814,7 @@ mod tests {
                         eprintln!("num: {}, idx: {} last: {}", num, i, last);
                     }
                     i += 1;
-                    assert!(num > last);
+                    assert!(num >= last);
                     last = num;
                     Ok(())
                 })
@@ -876,18 +862,17 @@ mod tests {
             }
             compare(&buffer, &exp);
 
-            eprintln!("Sorting using sort_by");
-            exp.sort_unstable_by(|a, b| a.cmp(b));
+            eprintln!("Sorting using sort.slice");
+            indexsort::sort_slice(&mut exp, |data, i, j| {
+                data[i].as_slice().cmp(data[j].as_slice()) == core::cmp::Ordering::Less
+            });
 
-            struct L;
-
-            impl Less for L {
-                fn less(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
-                    a.cmp(b)
-                }
-            }
-
-            buffer.sort_slice(L).unwrap();
+            eprintln!("Sorting using buffer.sort_slice");
+            buffer
+                .sort_slice(|a, b| a.cmp(b) == core::cmp::Ordering::Less)
+                .unwrap();
+            // same order after sort.
+            eprintln!("Done sorting");
             compare(&buffer, &exp);
         }
     }
@@ -919,5 +904,12 @@ mod tests {
         // Write something to buffer so sort actually happens.
         buf.write_bytes(b"abc").unwrap();
         // This test fails if the buffer has offset > currSz.
+    }
+
+    #[test]
+    fn test_sort() {
+        let mut vec = vec![1, 10, 5, 100, 20, 50, 11, 60];
+        vec.sort_by(|a, b| a.cmp(b));
+        eprintln!("{:?}", vec);
     }
 }

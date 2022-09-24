@@ -18,9 +18,10 @@ default = []
 fmmap = "0.3"
 thiserror = "1"
 rand = "0.8"
+indexsort = "*"
 
 [dev-dependencies]
-criterion = "0.3"
+criterion = "0.4"
 tempfile = "3"
 
 [profile.bench]
