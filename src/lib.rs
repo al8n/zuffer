@@ -1,41 +1,55 @@
 //! A template for creating Rust open-source repo on GitHub
 //!
+#![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(docsrs, allow(unused_attributes))]
 #![deny(missing_docs)]
+#![allow(const_item_mutation)]
 
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+#[cfg(not(feature = "std"))]
+use alloc::cell::RefCell;
+
+use core::sync::atomic::{AtomicI64, Ordering};
 use fmmap::{MmapFileExt, MmapFileMut, MmapFileMutExt};
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
+#[cfg(feature = "std")]
 use std::{
-    borrow::Borrow,
     cell::RefCell,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicI64, Ordering},
 };
 
 const TEMP_FILE_NAME_LEN: usize = 16;
 const TEMP_FILE_SUFFIX: &str = "buffer";
+const U32_SIZE: usize = core::mem::size_of::<u32>();
 
-///
+const EMPTY: [u8; 0] = [];
+
+/// Error in this crate
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    ///
+    /// cannot grow because of exceeds the max buffer size
     #[error("cannot grow because of exceeds the max buffer size {0}")]
     Oversize(usize),
-    ///
+
+    /// offset beyond current size
     #[error("offset: {0} beyond current size {1}")]
     Overflow(usize, usize),
-    ///
+
+    /// fail to truncate buffer
     #[error("fail to truncate buffer: {0}")]
     TruncateError(fmmap::error::Error),
-    ///
+
+    /// fail to mmap temp file
     #[error("fail to mmap temp file")]
     FailToMmapTempFile(#[from] fmmap::error::Error),
-    ///
+
+    /// io error
     #[error("IO error")]
     IO(#[from] std::io::Error),
 
-    ///
+    /// sort buffer start with zero
     #[error("sort buffer start with zero")]
     SortStartZero,
 }
@@ -48,25 +62,25 @@ pub struct AutoMmapMeta {
     dir: PathBuf,
 }
 
-/// Buffer type
+/// Zuffer type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BufferType {
-    /// Buffer in memory
+pub enum ZufferType {
+    /// Zuffer in memory
     Memory,
-    /// Buffer in by memory map to a disk file
+    /// Zuffer in by memory map to a disk file
     Mmap,
 }
 
-/// Buffer is equivalent of Go's bytes.Buffer without the ability to read. It is NOT thread-safe.
+/// Zuffer is equivalent of Go's bytes.Zuffer without the ability to read. It is NOT thread-safe.
 ///
 /// In Memory mode, default allocator is used to allocate memory, which depending upon how the code is
 /// compiled could use jemalloc for allocations.
 ///
-/// In Mmap mode, Buffer  uses file mmap to allocate memory. This allows us to store big data
+/// In Mmap mode, Zuffer  uses file mmap to allocate memory. This allows us to store big data
 /// structures without using physical memory.
 ///
-/// MaxSize can be set to limit the memory usage.
-pub struct Buffer {
+/// `max_size` can be set to limit the memory usage.
+pub struct Zuffer {
     /// number of starting bytes used for padding
     padding: i64,
 
@@ -74,7 +88,7 @@ pub struct Buffer {
     offset: AtomicI64,
 
     /// type of the underlying buffer
-    buf_type: BufferType,
+    buf_type: ZufferType,
 
     /// capacity of the buffer
     cur_size: usize,
@@ -94,13 +108,19 @@ pub struct Buffer {
     tag: &'static str,
 }
 
-impl Buffer {
+impl Zuffer {
     /// default capacity of the buffer
     pub const DEFAULT_CAPACITY: usize = 64;
 
+    const INIT_OFFSET: i64 = 8;
     const DEFAULT_TAG: &'static str = "buffer";
 
+    /// Returns a memory buffer with default capacity
     ///
+    /// **NOTE:**
+    ///
+    /// It is the caller's responsibility to set offset after this, because Zuffer
+    /// doesn't remember what it was.
     pub fn new(capacity: usize, mut tag: &'static str) -> Self {
         let capacity = capacity.max(Self::DEFAULT_CAPACITY);
         if tag.is_empty() {
@@ -110,9 +130,9 @@ impl Buffer {
         let mut mmap_file = MmapFileMut::memory_with_capacity("", capacity);
         mmap_file.truncate(capacity as u64).unwrap();
         Self {
-            padding: 8,
-            offset: AtomicI64::new(8),
-            buf_type: BufferType::Memory,
+            padding: Self::INIT_OFFSET,
+            offset: AtomicI64::new(Self::INIT_OFFSET),
+            buf_type: ZufferType::Memory,
             cur_size: capacity,
             max_size: None,
             mmap_file,
@@ -122,7 +142,12 @@ impl Buffer {
         }
     }
 
+    /// Returns a persistent buffer with default capacity
     ///
+    /// **NOTE:**
+    ///
+    /// It is the caller's responsibility to set offset after this, because Zuffer
+    /// doesn't remember what it was.
     pub fn persistent<P: AsRef<Path>>(capacity: usize, file: P) -> Result<Self, Error> {
         let mut mmap_file = MmapFileMut::open(file).map_err(Error::FailToMmapTempFile)?;
         mmap_file
@@ -130,9 +155,9 @@ impl Buffer {
             .map_err(Error::FailToMmapTempFile)?;
 
         Ok(Self {
-            padding: 8,
-            offset: AtomicI64::new(8),
-            buf_type: BufferType::Mmap,
+            padding: Self::INIT_OFFSET,
+            offset: AtomicI64::new(Self::INIT_OFFSET),
+            buf_type: ZufferType::Mmap,
             cur_size: mmap_file.len(),
             max_size: None,
             mmap_file,
@@ -142,7 +167,12 @@ impl Buffer {
         })
     }
 
+    /// Returns a temperary buffer with default capacity, the underlying temp file will be removed when the struct is dropped.
     ///
+    /// **NOTE:**
+    ///
+    /// It is the caller's responsibility to set offset after this, because Zuffer
+    /// doesn't remember what it was.
     pub fn temp<P: AsRef<Path>>(capacity: usize, dir: Option<P>) -> Result<Self, Error> {
         let path = if let Some(path) = dir {
             path.as_ref().to_path_buf()
@@ -156,7 +186,7 @@ impl Buffer {
         })
     }
 
-    fn new_buffer_file(path: PathBuf, mut capacity: usize) -> Result<Buffer, Error> {
+    fn new_buffer_file(path: PathBuf, mut capacity: usize) -> Result<Zuffer, Error> {
         if capacity < Self::DEFAULT_CAPACITY {
             capacity = Self::DEFAULT_CAPACITY;
         }
@@ -169,9 +199,9 @@ impl Buffer {
             .map_err(Error::FailToMmapTempFile)?;
 
         Ok(Self {
-            padding: 8,
-            offset: AtomicI64::new(8),
-            buf_type: BufferType::Mmap,
+            padding: Self::INIT_OFFSET,
+            offset: AtomicI64::new(Self::INIT_OFFSET),
+            buf_type: ZufferType::Mmap,
             cur_size: mmap_file.len(),
             max_size: None,
             mmap_file,
@@ -181,12 +211,17 @@ impl Buffer {
         })
     }
 
+    /// Returns a memory buffer with default capacity, but after the size exceeds the threshold, then the buffer will auto mmap to a temp file.
     ///
+    /// **NOTE:**
+    ///
+    /// It is the caller's responsibility to set offset after this, because Zuffer
+    /// doesn't remember what it was.  
     pub fn with_auto_mmap<NP>(mut self, threshold: usize, path: NP) -> Self
     where
         NP: AsRef<Path>,
     {
-        if !matches!(self.buf_type, BufferType::Memory) {
+        if !matches!(self.buf_type, ZufferType::Memory) {
             panic!("can only auto mmap with Memory buffer type");
         }
 
@@ -205,12 +240,12 @@ impl Buffer {
         self
     }
 
-    ///
+    /// Returns if the buffer is empty
     pub fn is_empty(&self) -> bool {
         self.offset.load(Ordering::SeqCst) == self.start_offset()
     }
 
-    ///
+    /// Returns the buffer start offset
     pub fn start_offset(&self) -> i64 {
         self.padding
     }
@@ -239,7 +274,7 @@ impl Buffer {
         &mut self.mmap_file.as_mut_slice()[self.padding as usize..off]
     }
 
-    ///
+    /// Returns the underlying data in range `[offset..current_size - offset]`
     pub fn data(&self, offset: usize) -> Result<&[u8], Error> {
         if offset > self.cur_size {
             return Err(Error::Overflow(offset, self.cur_size));
@@ -247,7 +282,7 @@ impl Buffer {
         Ok(self.mmap_file.slice(offset, self.cur_size - offset))
     }
 
-    ///
+    /// Returns the mutable underlying data in range `[offset..current_size - offset]`
     pub fn data_mut(&mut self, offset: usize) -> Result<&mut [u8], Error> {
         if offset > self.cur_size {
             return Err(Error::Overflow(offset, self.cur_size));
@@ -276,11 +311,11 @@ impl Buffer {
             .max(n); // Allocate at least n, even if it exceeds the 1GB limit above.
 
         match self.buf_type {
-            BufferType::Memory => {
+            ZufferType::Memory => {
                 // If autoMmap gets triggered, copy the slice over to an mmaped file.
                 if let Some(ref meta) = self.auto_mmap_meta {
                     if meta.after > 0 && self.cur_size > meta.after {
-                        self.buf_type = BufferType::Mmap;
+                        self.buf_type = ZufferType::Mmap;
                         let mut file = meta.dir.clone();
 
                         file.push(
@@ -322,7 +357,7 @@ impl Buffer {
                 self.mmap_file.truncate(self.cur_size as u64).unwrap();
                 Ok(())
             }
-            BufferType::Mmap => {
+            ZufferType::Mmap => {
                 // Truncate and remap the underlying file.
                 self.mmap_file
                     .truncate(self.cur_size as u64)
@@ -336,7 +371,7 @@ impl Buffer {
     ///
     /// # Warning:
     /// Allocate is not thread-safe. The byte slice returned MUST be used before
-    /// further calls to Buffer.
+    /// further calls to Zuffer.
     pub fn allocate(&mut self, n: usize) -> Result<&mut [u8], Error> {
         self.grow(n).map(|_| {
             let off = self.offset.fetch_add(n as i64, Ordering::SeqCst);
@@ -356,14 +391,14 @@ impl Buffer {
     /// this big buffer.
     /// Note that `slice_allocate` should NOT be mixed with normal calls to `write`.
     pub fn slice_allocate(&mut self, size: usize) -> Result<&mut [u8], Error> {
-        self.grow(4 + size).and_then(|_| {
+        self.grow(U32_SIZE + size).and_then(|_| {
             self.slice_allocate_in(size)
                 .and_then(|_| self.allocate(size))
         })
     }
 
     fn slice_allocate_in(&mut self, size: usize) -> Result<(), Error> {
-        self.allocate(4).map(|buf| {
+        self.allocate(U32_SIZE).map(|buf| {
             buf.copy_from_slice(&(size as u32).to_be_bytes());
         })
     }
@@ -378,7 +413,7 @@ impl Buffer {
         })
     }
 
-    ///
+    /// Write all bytes to the buffer
     pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), Error> {
         self.slice_allocate(bytes.len()).map(|dst| {
             dst.copy_from_slice(bytes);
@@ -392,10 +427,9 @@ impl Buffer {
 
     /// `slice` would return the slice written at offset.
     pub fn slice(&self, offset: i64) -> (&[u8], i64) {
-        const EMPTY: &[u8] = &[];
         let cur_offset = self.offset.load(Ordering::SeqCst);
         if offset >= cur_offset {
-            return (EMPTY, -1);
+            return (&EMPTY, -1);
         }
 
         let size = u32::from_be_bytes(
@@ -403,7 +437,7 @@ impl Buffer {
                 .try_into()
                 .unwrap(),
         );
-        let start = offset + 4;
+        let start = offset + U32_SIZE as i64;
         let mut next = start + size as i64;
         let res = &self.mmap_file.as_slice()[start as usize..next as usize];
 
@@ -415,25 +449,26 @@ impl Buffer {
     }
 
     /// `slice_mut` would return the slice written at offset.
-    pub fn slice_mut(&mut self, offset: i64) -> (Option<&mut [u8]>, i64) {
+    pub fn slice_mut(&mut self, offset: i64) -> (&mut [u8], i64) {
         let cur_offset = self.offset.load(Ordering::SeqCst) as i64;
         if offset >= cur_offset {
-            return (None, -1);
+            return (&mut EMPTY, -1);
         }
 
+        let src = self.mmap_file.as_mut_slice();
         let size = u32::from_be_bytes(
-            self.mmap_file.as_slice()[offset as usize..offset as usize + 4]
+            src[offset as usize..offset as usize + 4]
                 .try_into()
                 .unwrap(),
         );
-        let start = offset + 4;
+        let start = offset + U32_SIZE as i64;
         let mut next = start + size as i64;
-        let res = &mut self.mmap_file.as_mut_slice()[start as usize..next as usize];
+        let res = &mut src[start as usize..next as usize];
         if next >= cur_offset {
             next = -1;
         }
 
-        (Some(res), next)
+        (res, next)
     }
 
     /// `slice_offsets` is an expensive function. Use sparingly.
@@ -447,7 +482,7 @@ impl Buffer {
         offsets
     }
 
-    ///
+    /// Iterates over the buffer
     pub fn slice_iterate<F>(&self, mut f: F) -> Result<(), Error>
     where
         F: FnMut(&[u8]) -> Result<(), Error>,
@@ -468,8 +503,8 @@ impl Buffer {
         Ok(())
     }
 
-    ///
-    pub fn slice_iterate_mut<F>(&mut self, mut f: F) -> Result<(), Error>
+    /// Iterates over the buffer
+    pub fn slice_iterate_mut<F>(&mut self, f: F) -> Result<(), Error>
     where
         F: Fn(&mut [u8]) -> Result<(), Error>,
     {
@@ -481,22 +516,18 @@ impl Buffer {
         while next >= 0 {
             let (slice, nxt) = self.slice_mut(next);
             next = nxt;
-            if let Some(s) = slice {
-                if s.is_empty() {
-                    continue;
-                }
-
-                if let Err(e) = f(s) {
-                    return Err(e);
-                }
+            if slice.is_empty() {
+                continue;
             }
+
+            f(slice)?
         }
         Ok(())
     }
 
     fn sort_slice<L>(&mut self, less: L) -> Result<(), Error>
     where
-        L: Copy + Fn(&[u8], &[u8]) -> bool,
+        L: Fn(&[u8], &[u8]) -> bool,
     {
         self.sort_slice_between(
             self.start_offset(),
@@ -507,8 +538,9 @@ impl Buffer {
 
     fn sort_slice_between<L>(&mut self, start: i64, end: i64, less: L) -> Result<(), Error>
     where
-        L: Copy + Fn(&[u8], &[u8]) -> bool,
+        L: Fn(&[u8], &[u8]) -> bool,
     {
+        const KB: usize = 1024;
         if start >= end {
             return Ok(());
         }
@@ -520,7 +552,7 @@ impl Buffer {
         let mut offsets = Vec::with_capacity(16);
         let (mut next, mut count) = (start, 0);
         while next >= 0 && next < end {
-            if count % 1024 == 0 {
+            if count % KB == 0 {
                 offsets.push(next);
             }
             let (_, nxt) = self.slice(next);
@@ -538,9 +570,9 @@ impl Buffer {
         let mut s = SortHelper {
             offsets: offsets.as_slice(),
             original: self,
-            tmp: RefCell::new(Buffer::new(sz_tmp, tag)),
+            tmp: RefCell::new(Zuffer::new(sz_tmp, tag)),
             small: {
-                let mut vec = Vec::with_capacity(1024);
+                let mut vec = Vec::with_capacity(KB);
                 vec.fill(0);
                 vec
             },
@@ -548,28 +580,37 @@ impl Buffer {
 
         let mut left = offsets[0];
         for off in offsets.iter().skip(1) {
-            s.sort_small(left, *off, less)?;
+            s.sort_small(left, *off, &less)?;
             left = *off;
         }
 
-        s.sort(0, offsets.len() - 1, less);
+        s.sort(0, offsets.len() - 1, &less);
         Ok(())
+    }
+}
+
+impl Drop for Zuffer {
+    fn drop(&mut self) {
+        if !self.persistent && matches!(self.buf_type, ZufferType::Mmap) {
+            self.mmap_file.set_remove_on_drop(true);
+        }
     }
 }
 
 struct SortHelper<'a> {
     offsets: &'a [i64],
-    original: &'a mut Buffer,
-    tmp: RefCell<Buffer>,
+    original: &'a mut Zuffer,
+    tmp: RefCell<Zuffer>,
     small: Vec<i64>,
 }
 
 impl<'a> SortHelper<'a> {
-    fn sort_small<L>(&mut self, start: i64, end: i64, mut less: L) -> Result<(), Error>
+    fn sort_small<L>(&mut self, start: i64, end: i64, less: &L) -> Result<(), Error>
     where
-        L: Copy + Fn(&[u8], &[u8]) -> bool,
+        L: Fn(&[u8], &[u8]) -> bool,
     {
-        self.tmp.borrow().reset();
+        let mut tmp = self.tmp.borrow_mut();
+        tmp.reset();
         self.small.clear();
         let mut next = start;
         while next >= 0 && next < end {
@@ -585,28 +626,30 @@ impl<'a> SortHelper<'a> {
             less(left, right)
         });
 
+        let src = self.original.mmap_file.as_slice();
         // Now we iterate over the s.small offsets and copy over the slices. The result is now in order.
         for off in self.small.iter() {
-            let src = &self.original.mmap_file.as_slice()[*off as usize..];
-            self.tmp.borrow_mut().write(raw_slice(src))?;
+            let src = &src[*off as usize..];
+            tmp.write(raw_slice(src))?;
         }
 
         self.original
             .mmap_file
-            .write_all(self.tmp.borrow().bytes(), start as usize)
+            .write_all(tmp.bytes(), start as usize)
             .map_err(From::from)
     }
 
-    fn sort<L>(&self, lo: usize, hi: usize, less: L) -> &[u8]
+    fn sort<L>(&self, lo: usize, hi: usize, less: &L) -> &[u8]
     where
-        L: Copy + Fn(&[u8], &[u8]) -> bool,
+        L: Fn(&[u8], &[u8]) -> bool,
     {
         assert!(lo <= hi);
+        let src = self.original.mmap_file.as_slice();
         let mid = lo + (hi - lo) / 2;
         let (loff, hoff) = (self.offsets[lo] as usize, self.offsets[hi] as usize);
 
         if lo == mid {
-            return &self.original.mmap_file.as_slice()[loff..hoff];
+            return &src[loff..hoff];
         }
 
         // lo, mid would sort from [offset[lo], offset[mid]) .
@@ -616,12 +659,12 @@ impl<'a> SortHelper<'a> {
         let right = self.sort(mid, hi, less);
 
         self.merge(left, right, loff, hoff, less);
-        &self.original.mmap_file.as_slice()[loff..hoff]
+        &src[loff..hoff]
     }
 
-    fn merge<L>(&self, left: &[u8], right: &[u8], mut start: usize, end: usize, less: L)
+    fn merge<L>(&self, left: &[u8], right: &[u8], mut start: usize, end: usize, less: &L)
     where
-        L: Copy + Fn(&[u8], &[u8]) -> bool,
+        L: Fn(&[u8], &[u8]) -> bool,
     {
         if left.is_empty() || right.is_empty() {
             return;
@@ -634,10 +677,11 @@ impl<'a> SortHelper<'a> {
         }
         let mut left = tmp.bytes();
         let mut right = right;
+        let buf_ptr = self.original.mmap_file.as_slice().as_ptr() as *mut u8;
         while start < end {
             if left.is_empty() {
                 unsafe {
-                    let ptr = (self.original.mmap_file.as_slice().as_ptr() as *mut u8).add(start);
+                    let ptr = buf_ptr.add(start);
                     std::ptr::copy_nonoverlapping(right.as_ptr(), ptr, end - start);
                 }
                 return;
@@ -645,8 +689,8 @@ impl<'a> SortHelper<'a> {
 
             if right.is_empty() {
                 unsafe {
-                    let ptr = (self.original.mmap_file.as_slice().as_ptr() as *mut u8).add(start);
-                    std::ptr::copy_nonoverlapping(left.as_ptr(), ptr, end - start);
+                    let ptr = buf_ptr.add(start);
+                    core::ptr::copy_nonoverlapping(left.as_ptr(), ptr, end - start);
                 }
                 return;
             }
@@ -654,14 +698,13 @@ impl<'a> SortHelper<'a> {
             let ls = raw_slice(left);
             let rs = raw_slice(right);
 
-            match less(&ls[4..], &rs[4..]) {
+            match less(&ls[U32_SIZE..], &rs[U32_SIZE..]) {
                 true => {
                     let src_len = ls.len();
                     unsafe {
-                        let ptr =
-                            (self.original.mmap_file.as_slice().as_ptr() as *mut u8).add(start);
+                        let ptr = buf_ptr.add(start);
 
-                        std::ptr::copy_nonoverlapping(ls.as_ptr(), ptr, src_len);
+                        core::ptr::copy_nonoverlapping(ls.as_ptr(), ptr, src_len);
                     }
                     left = &left[src_len..];
                     start += src_len;
@@ -669,10 +712,9 @@ impl<'a> SortHelper<'a> {
                 false => {
                     let src_len = rs.len();
                     unsafe {
-                        let ptr =
-                            (self.original.mmap_file.as_slice().as_ptr() as *mut u8).add(start);
+                        let ptr = buf_ptr.add(start);
 
-                        std::ptr::copy_nonoverlapping(rs.as_ptr(), ptr, src_len);
+                        core::ptr::copy_nonoverlapping(rs.as_ptr(), ptr, src_len);
                     }
                     right = &right[src_len..];
                     start += src_len;
@@ -682,9 +724,10 @@ impl<'a> SortHelper<'a> {
     }
 }
 
+#[inline]
 fn raw_slice(buf: &[u8]) -> &[u8] {
-    let sz = u32::from_be_bytes(buf[..4].try_into().unwrap());
-    &buf[..4 + sz as usize]
+    let sz = u32::from_be_bytes(buf[..U32_SIZE].try_into().unwrap());
+    &buf[..U32_SIZE + sz as usize]
 }
 
 #[inline]
@@ -707,10 +750,10 @@ mod tests {
 
     use super::*;
 
-    fn new_test_buffers(capacity: usize) -> Vec<Buffer> {
+    fn new_test_buffers(capacity: usize) -> Vec<Zuffer> {
         vec![
-            Buffer::new(capacity, "test"),
-            Buffer::temp(capacity, Some("")).unwrap(),
+            Zuffer::new(capacity, "test"),
+            Zuffer::temp(capacity, Some("")).unwrap(),
         ]
     }
 
@@ -726,7 +769,7 @@ mod tests {
         let buffers = new_test_buffers(CAP);
         for mut buffer in buffers {
             // This is just for verifying result
-            let mut bytes_buf = Buffer::new(CAP, "test");
+            let mut bytes_buf = Zuffer::new(CAP, "test");
 
             // Writer small bytes
             let mut small_data = [0u8; 256];
@@ -737,7 +780,7 @@ mod tests {
             buffer.write(&small_data).unwrap();
             buffer.write(&big_data).unwrap();
 
-            // Write data to bytesBuffer also, just to match result.
+            // Write data to bytesZuffer also, just to match result.
             bytes_buf.write(&small_data).unwrap();
             bytes_buf.write(&big_data).unwrap();
             assert_eq!(buffer.bytes(), bytes_buf.bytes());
@@ -754,7 +797,7 @@ mod tests {
             rng.fill_bytes(&mut data);
 
             // This is just for verifying result
-            let mut bytes_buf = Buffer::new(CAP, "test");
+            let mut bytes_buf = Zuffer::new(CAP, "test");
             let mut end = 32;
             for _ in 0..3 {
                 let n = buffer.write(&data[..end]).unwrap();
@@ -771,7 +814,7 @@ mod tests {
     #[test]
     fn test_buffer_auto_mmap() {
         let mut buffer =
-            Buffer::new(1 << 20, "test").with_auto_mmap(64 << 20, std::env::temp_dir());
+            Zuffer::new(1 << 20, "test").with_auto_mmap(64 << 20, std::env::temp_dir());
 
         const N: usize = 128 << 10;
 
@@ -785,7 +828,7 @@ mod tests {
             }
         }
 
-        eprintln!("Buffer size: {}", buffer.len_with_padding());
+        eprintln!("Zuffer size: {}", buffer.len_with_padding());
     }
 
     #[test]
@@ -793,7 +836,7 @@ mod tests {
         let buffers = new_test_buffers(1 << 20);
         let mut rng = rand::thread_rng();
         for mut buffer in buffers {
-            (0..25600).for_each(|i| {
+            (0..25600).for_each(|_i| {
                 let b = buffer.slice_allocate(4).unwrap();
                 b.copy_from_slice(u32::to_be_bytes(rng.gen_range(0..25600)).as_slice());
             });
@@ -849,7 +892,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
 
-            fn compare(buf: &Buffer, exp: &Vec<Vec<u8>>) {
+            fn compare(buf: &Zuffer, exp: &Vec<Vec<u8>>) {
                 let mut i = 0;
                 buf.slice_iterate(|v| {
                     // All the slices returned by the buffer should be equal to what we
@@ -900,16 +943,58 @@ mod tests {
 
     #[test]
     fn test_small_buffer() {
-        let mut buf = Buffer::new(5, "test");
+        let mut buf = Zuffer::new(5, "test");
         // Write something to buffer so sort actually happens.
         buf.write_bytes(b"abc").unwrap();
         // This test fails if the buffer has offset > currSz.
+        buf.sort_slice(|_left, _right| true).unwrap();
     }
 
     #[test]
-    fn test_sort() {
-        let mut vec = vec![1, 10, 5, 100, 20, 50, 11, 60];
-        vec.sort_by(|a, b| a.cmp(b));
-        eprintln!("{:?}", vec);
+    fn test_buffer_sort() {
+        const CAP: usize = 32;
+        let buffers = new_test_buffers(CAP);
+
+        let mut rng = thread_rng();
+
+        for mut buffer in buffers {
+            eprintln!("using buffer type: {:?}", buffer.buf_type);
+            const N: usize = 10_000;
+            for _ in 0..N {
+                let new_slice = buffer.slice_allocate(8).unwrap();
+                let uid = rng.gen();
+                new_slice.copy_from_slice(&u64::to_be_bytes(uid));
+            }
+
+            let mut test = |start: i64, end: i64| {
+                let start = buffer.start_offset() + 12 * start;
+                let end = buffer.start_offset() + 12 * end;
+                buffer
+                    .sort_slice_between(start, end, |ls, rs| {
+                        let lhs = u64::from_be_bytes(ls[..8].try_into().unwrap());
+                        let rhs = u64::from_be_bytes(rs[..8].try_into().unwrap());
+                        lhs < rhs
+                    })
+                    .unwrap();
+
+                #[allow(unused_assignments)]
+                let (mut slice, mut next) = (EMPTY.as_mut_slice(), start);
+                let mut last = 0u64;
+                let mut count = 0;
+                while next >= 0 && next < end {
+                    (slice, next) = buffer.slice_mut(next);
+                    let uid = u64::from_be_bytes(slice[..8].try_into().unwrap());
+                    assert!(uid >= last);
+                    last = uid;
+                    count += 1;
+                }
+                assert_eq!(count, (end - start) / 12);
+            };
+
+            for i in (10..N).step_by(10) {
+                test((i - 10) as i64, i as i64);
+            }
+            test(0, N as i64);
+        }
     }
 }

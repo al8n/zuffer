@@ -1,18 +1,16 @@
 [package]
 name = "zuffer"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
-repository = "https://github.com/al8n/zuffer"
-description = "A template for creating Rust open-source repo on GitHub"
+repository = "https://github.com/al8n/veladb/tree/main/zuffer"
+description = "A mmap file based buffer implementation."
 license = "MIT/Apache-2.0"
-
-[[bench]]
-path = "benches/foo.rs"
-name = "foo"
-harness = false
+keywords = ["buffer", "mmap", "file", "memmap", "memmap2"]
+category = ["data-structures"]
 
 [features]
-default = []
+default = ["std"]
+std = []
 
 [dependencies]
 fmmap = "0.3"
@@ -23,16 +21,6 @@ indexsort = "*"
 [dev-dependencies]
 criterion = "0.4"
 tempfile = "3"
-
-[profile.bench]
-opt-level = 3
-debug = false
-codegen-units = 1
-lto = 'thin'
-incremental = false
-debug-assertions = false
-overflow-checks = false
-rpath = false
 
 [package.metadata.docs.rs]
 all-features = true
